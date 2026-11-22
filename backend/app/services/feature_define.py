@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.feature_projection import project_catalog
 from app.store import store
 
 
@@ -95,16 +96,9 @@ class FeatureDefineService(BaseModuleService):
         }
 
     def export_feature_catalog(self) -> list[dict[str, Any]]:
-        """导出全量特征定义目录，包含编码、名称、类型、来源与逻辑供下游系统写入。"""
-        rows = store.rows(self.MODULE)
-        catalog = []
-        for r in rows:
-            catalog.append({
-                "feature_code": r.get("特征编号"),
-                "feature_name": r.get("特征名称"),
-                "feature_type": r.get("特征类型"),
-                "data_source": r.get("数据来源"),
-                "compute_logic": r.get("计算逻辑"),
-                "version": r.get("特征版本"),
-            })
-        return catalog
+        """导出全量特征定义目录，包含编码、名称、类型、来源与逻辑供下游系统写入。
+
+        目录在同一提交截面上读取，每一行都来自同一批次。
+        """
+        snapshot = store.snapshot((self.MODULE,))
+        return project_catalog(snapshot.table(self.MODULE))

@@ -24,7 +24,7 @@ class BaseModuleService:
         page: int = 1,
         size: int = 20,
     ) -> tuple[list[dict[str, Any]], int]:
-        rows = list(store.rows(self.MODULE))
+        rows = list(store.snapshot((self.MODULE,)).table(self.MODULE))
         for field, expected in (filters or {}).items():
             if field in self.LIST_FIELDS:
                 rows = [
@@ -50,25 +50,27 @@ class BaseModuleService:
         ]
         if missing:
             return None, missing
-        rows = store.rows(self.MODULE)
-        entry = {"id": max((int(row.get("id", 0)) for row in rows), default=0) + 1}
-        entry.update({field: values.get(field) for field in self.LIST_FIELDS})
-        entry["status"] = self.STATUS_ORDER[0]
-        entry["pending"] = True
-        entry["abnormal"] = False
-        rows.append(entry)
+        with store.transaction() as txn:
+            entry = txn.insert(self.MODULE, {
+                **{field: values.get(field) for field in self.LIST_FIELDS},
+                "status": self.STATUS_ORDER[0],
+                "pending": True,
+                "abnormal": False,
+            })
         return entry, []
 
     def run_action(self, entry_id: int, action: str) -> tuple[dict[str, Any] | None, str]:
-        entry = store.find(self.MODULE, entry_id)
-        if entry is None:
-            return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
-        target = self.ACTION_RULES.get(action)
-        if target is None:
-            return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
-        entry["status"] = target
-        entry["pending"] = target != self.STATUS_ORDER[-1]
-        entry["abnormal"] = action in self.NEGATIVE_ACTIONS
+        with store.transaction() as txn:
+            entry = txn.find(self.MODULE, entry_id)
+            if entry is None:
+                return None, f"{self.ENTITY} {entry_id} 不存在或已归档"
+            target = self.ACTION_RULES.get(action)
+            if target is None:
+                return None, f"动作「{action}」不属于{self.MODULE}可执行范围"
+            entry["status"] = target
+            entry["pending"] = target != self.STATUS_ORDER[-1]
+            entry["abnormal"] = action in self.NEGATIVE_ACTIONS
+            txn.dirty = True
         return entry, f"{self.ENTITY}已{action}"
 
     def domain_snapshot(self) -> dict[str, Any]:

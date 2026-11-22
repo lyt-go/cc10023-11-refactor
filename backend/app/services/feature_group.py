@@ -4,6 +4,12 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.feature_projection import (
+    project_group_export,
+    project_group_views,
+    read_group,
+    serialize_training_manifest,
+)
 from app.store import store
 
 
@@ -19,51 +25,57 @@ class FeatureGroupService(BaseModuleService):
 
     # ── 链路4: 特征组 → 训练流水线 → 模型注册 ──
     def export_group_features(self, group_id: int) -> dict[str, Any]:
-        """查询特征组内所有已生效特征定义并导出为训练流水线可用格式。"""
-        group = store.find(self.MODULE, group_id)
-        if group is None:
+        """查询特征组内所有已生效特征定义并导出为训练流水线可用格式。
+
+        组与定义在同一提交截面上读取，成功结果不会混入两个批次的字段。
+        """
+        snapshot = store.snapshot((self.MODULE, "feature_define"))
+        group_row = snapshot.find(self.MODULE, group_id)
+        if group_row is None:
             return {"ok": False, "message": f"特征组 {group_id} 不存在"}
-        feature_names = [f.strip() for f in (group.get("包含特征") or "").split(",") if f.strip()]
-        define_rows = store.rows("feature_define")
-        matched = [r for r in define_rows if r.get("特征名称") in feature_names and r.get("status") == "已生效"]
-        result = {
-            "group_id": group_id,
-            "group_name": group.get("组名称"),
-            "feature_count": len(matched),
-            "features": [
-                {"name": r.get("特征名称"), "type": r.get("特征类型"), "logic": r.get("计算逻辑")}
-                for r in matched
-            ],
-        }
+        group = read_group(group_row)
+        result = project_group_export(
+            group_id, group, snapshot.table("feature_define"),
+        )
         return {"ok": True, "data": result}
 
     def create_training_pipeline(self, group_id: int) -> dict[str, Any]:
-        """基于特征组创建训练流水线配置，关联特征集并初始化算法参数。"""
-        export = self.export_group_features(group_id)
-        if not export.get("ok"):
-            return export
-        data = export["data"]
-        pipeline_rows = store.rows("train_pipeline")
-        next_id = max((int(r.get("id", 0)) for r in pipeline_rows), default=0) + 1
-        group = store.find(self.MODULE, group_id)
-        pipeline_rows.append({
-            "id": next_id,
-            "status": "草稿",
-            "pending": True,
-            "abnormal": False,
-            "流水线编号": f"PIPE-{next_id:04d}",
-            "流水线名称": f"train_{group.get('组名称', 'unknown')}_pipeline",
-            "特征集": group.get("包含特征", ""),
-            "算法类型": "xgboost",
-            "超参数配置": '{"max_depth":6,"learning_rate":0.1,"n_estimators":100}',
-            "评估指标": "auc,logloss",
-            "训练周期": "weekly",
-            "流水线版本": "v1.0.0",
-        })
+        """基于特征组创建训练流水线配置，关联特征集并初始化算法参数。
+
+        组、定义读取与流水线登记在同一事务内完成；组导出所用的定义投影
+        原样写入训练准备清单，后续启动训练不再回读实时定义。
+        """
+        with store.transaction() as txn:
+            group_row = txn.find(self.MODULE, group_id)
+            if group_row is None:
+                return {"ok": False, "message": f"特征组 {group_id} 不存在"}
+
+            group = read_group(group_row)
+            export, manifest = project_group_views(
+                group_id, group, txn.rows("feature_define"),
+            )
+            next_id = txn.next_id("train_pipeline")
+            txn.insert("train_pipeline", {
+                "id": next_id,
+                "status": "草稿",
+                "pending": True,
+                "abnormal": False,
+                "流水线编号": f"PIPE-{next_id:04d}",
+                "流水线名称": f"train_{group.name or 'unknown'}_pipeline",
+                "特征集": group_row.get("包含特征", ""),
+                "算法类型": "xgboost",
+                "超参数配置": '{"max_depth":6,"learning_rate":0.1,"n_estimators":100}',
+                "评估指标": "auc,logloss",
+                "训练周期": "weekly",
+                "流水线版本": "v1.0.0",
+                "训练准备清单": serialize_training_manifest(manifest),
+                "定义批次": str(txn.generation),
+            })
+
         return {
             "ok": True,
             "pipeline_id": next_id,
-            "feature_count": data["feature_count"],
+            "feature_count": export["feature_count"],
             "message": f"已基于特征组 {group_id} 创建训练流水线 {next_id}",
         }
 

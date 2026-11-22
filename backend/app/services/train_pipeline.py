@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.services.base import BaseModuleService
+from app.services.feature_projection import read_training_manifest
 from app.store import store
 
 
@@ -19,10 +20,19 @@ class TrainPipelineService(BaseModuleService):
 
     # ── 链路4: 特征组 → 训练流水线 → 模型注册 ──
     def train_and_register_model(self, pipeline_id: int) -> dict[str, Any]:
-        """执行训练流水线并将产物注册到模型中心，关联特征集和评估指标。"""
+        """执行训练流水线并将产物注册到模型中心，关联特征集和评估指标。
+
+        有训练准备清单的流水线按清单里的定义版本、类型与逻辑送训；
+        没有组投影的历史流水线沿用原有“特征集”配置。
+        """
         pipe = store.find(self.MODULE, pipeline_id)
         if pipe is None:
             return {"ok": False, "message": f"流水线 {pipeline_id} 不存在"}
+        manifest = read_training_manifest(pipe)
+        if manifest is None:
+            training_features = pipe.get("特征集", "")
+        else:
+            training_features = ",".join(str(item.get("name")) for item in manifest)
         pipe["status"] = "训练中"
         pipe["pending"] = True
         model_rows = store.rows("model_registry")
@@ -35,7 +45,7 @@ class TrainPipelineService(BaseModuleService):
             "模型编号": f"MODEL-{next_id:04d}",
             "模型名称": f"model_{pipe.get('流水线名称', 'unknown')}_v1",
             "算法类型": pipe.get("算法类型", "xgboost"),
-            "训练特征": pipe.get("特征集", ""),
+            "训练特征": training_features,
             "模型版本": "v1.0.0",
             "模型文件": f"models/pipeline_{pipeline_id}.pkl",
             "评估分数": "0.892",
@@ -43,7 +53,39 @@ class TrainPipelineService(BaseModuleService):
         })
         pipe["status"] = "已完成"
         pipe["pending"] = False
-        return {"ok": True, "pipeline_id": pipeline_id, "model_id": next_id, "score": 0.892}
+        result: dict[str, Any] = {
+            "ok": True,
+            "pipeline_id": pipeline_id,
+            "model_id": next_id,
+            "score": 0.892,
+            "training_features": training_features,
+            "definition_batch": pipe.get("定义批次") if manifest is not None else None,
+        }
+        if manifest is not None:
+            result["features"] = manifest
+        return result
+
+    def prepare_training_input(self, pipeline_id: int) -> dict[str, Any]:
+        """读取流水线的训练准备清单；历史流水线按原有配置保留特征输入。"""
+        pipe = store.find(self.MODULE, pipeline_id)
+        if pipe is None:
+            return {"ok": False, "message": f"流水线 {pipeline_id} 不存在"}
+        manifest = read_training_manifest(pipe)
+        if manifest is None:
+            return {
+                "ok": True,
+                "pipeline_id": pipeline_id,
+                "source": "legacy",
+                "features": [],
+                "feature_set": pipe.get("特征集", ""),
+            }
+        return {
+            "ok": True,
+            "pipeline_id": pipeline_id,
+            "source": "group_manifest",
+            "features": manifest,
+            "feature_set": pipe.get("特征集", ""),
+        }
 
     def validate_pipeline_config(self, pipeline_id: int) -> dict[str, Any]:
         """校验训练流水线的配置完整性，包括特征集引用和超参数合法性。"""
